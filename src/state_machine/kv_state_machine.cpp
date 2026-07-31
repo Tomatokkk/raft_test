@@ -22,6 +22,7 @@ constexpr std::uint16_t kStateVersion = 1;
 constexpr std::uint16_t kSnapshotRecordVersion = 1;
 constexpr std::uint64_t kMaximumItemCount = 100000000;
 constexpr std::size_t kMaximumStateFile = 1024ULL * 1024 * 1024;
+constexpr std::size_t kMaximumCachedResults = 65536;
 
 nuraft::ptr<nuraft::buffer> to_buffer(
         const std::vector<std::uint8_t>& bytes) {
@@ -104,11 +105,11 @@ nuraft::ptr<nuraft::buffer> KvStateMachine::commit(
         }
     }
 
-    // A storage exception is intentionally allowed to escape. NuRaft treats
-    // commit exceptions as fatal and invokes state_mgr::system_exit; serving
-    // after losing durable state would be unsafe.
     state_.last_commit_index = log_index;
-    persist_state_locked();
+    recent_results_[log_index] = result;
+    while (recent_results_.size() > kMaximumCachedResults) {
+        recent_results_.erase(recent_results_.begin());
+    }
     return encode_result(result);
 }
 
@@ -118,7 +119,6 @@ void KvStateMachine::commit_config(
     static_cast<void>(new_config);
     std::lock_guard<std::mutex> lock(mutex_);
     state_.last_commit_index = log_index;
-    persist_state_locked();
 }
 
 ApplyResult KvStateMachine::apply_locked(const Command& command) {
@@ -258,6 +258,39 @@ std::optional<std::string> KvStateMachine::get(
         return std::nullopt;
     }
     return found->second;
+}
+
+std::vector<std::optional<std::string>> KvStateMachine::get_many(
+        const std::vector<std::string>& keys) const {
+    std::vector<std::optional<std::string>> output;
+    output.reserve(keys.size());
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (const auto& key : keys) {
+        const auto found = state_.kv.find(key);
+        if (found == state_.kv.end()) {
+            output.emplace_back(std::nullopt);
+        } else {
+            output.emplace_back(found->second);
+        }
+    }
+    return output;
+}
+
+std::optional<ApplyResult> KvStateMachine::take_result(
+        nuraft::ulong log_index) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto found = recent_results_.find(log_index);
+    if (found == recent_results_.end()) {
+        return std::nullopt;
+    }
+    ApplyResult output = std::move(found->second);
+    recent_results_.erase(found);
+    return output;
+}
+
+void KvStateMachine::checkpoint() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    persist_state_locked();
 }
 
 std::size_t KvStateMachine::size() const {
@@ -426,7 +459,6 @@ void KvStateMachine::load_snapshot_metadata() {
         state_.last_commit_index) {
         install_state_locked(
             deserialize_state(snapshot.state_payload));
-        persist_state_locked();
     }
     last_snapshot_ = std::move(snapshot.metadata);
 }
@@ -557,7 +589,7 @@ bool KvStateMachine::apply_snapshot(nuraft::snapshot& snapshot) {
             std::lock_guard<std::mutex> lock(mutex_);
             install_state_locked(std::move(replacement));
             last_snapshot_ = std::move(stored.metadata);
-            persist_state_locked();
+            recent_results_.clear();
         }
         if (logger_) {
             logger_->info(

@@ -17,8 +17,9 @@ namespace strongkv {
 
 class Logger;
 
-// Applies only committed NuRaft entries. The complete applied state and dedup
-// table are atomically durable at the index returned by last_commit_index().
+// Applies only committed NuRaft entries. Raft's replicated WAL is the durable
+// source of truth between snapshots; the full KV image is persisted only for
+// snapshots and orderly-shutdown checkpoints.
 class KvStateMachine final : public nuraft::state_machine {
 public:
     KvStateMachine(std::filesystem::path state_dir,
@@ -50,6 +51,10 @@ public:
         nuraft::async_result<bool>::handler_type& when_done) override;
 
     std::optional<std::string> get(const std::string& key) const;
+    std::vector<std::optional<std::string>> get_many(
+        const std::vector<std::string>& keys) const;
+    std::optional<ApplyResult> take_result(nuraft::ulong log_index);
+    void checkpoint() const;
     std::size_t size() const;
 
 private:
@@ -99,6 +104,7 @@ private:
 
     mutable std::mutex mutex_;
     StateData state_;
+    std::map<nuraft::ulong, ApplyResult> recent_results_;
     nuraft::ptr<nuraft::snapshot> last_snapshot_;
 };
 

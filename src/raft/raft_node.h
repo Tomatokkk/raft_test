@@ -7,11 +7,16 @@
 #include <strongkv/config.h>
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
+#include <deque>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
+#include <vector>
 
 namespace strongkv {
 
@@ -51,6 +56,10 @@ struct RaftNodeInfo {
     std::uint64_t last_applied{0};
     std::uint64_t snapshot_index{0};
     std::size_t cluster_size{0};
+    std::uint64_t proposal_batches{0};
+    std::uint64_t proposal_entries{0};
+    std::uint64_t read_batches{0};
+    std::uint64_t read_requests{0};
 };
 
 // Owns the NuRaft launcher and exposes only operations with service-level
@@ -77,9 +86,26 @@ public:
     int fatal_storage_error() const noexcept;
 
 private:
+    struct PendingProposal {
+        Command command;
+        std::promise<RaftCommandResult> completion;
+    };
+
+    struct PendingRead {
+        std::string key;
+        std::promise<LinearizableGetResult> completion;
+    };
+
     nuraft::cb_func::ReturnCode on_raft_event(
         nuraft::cb_func::Type type, nuraft::cb_func::Param* param);
     static RaftRequestStatus map_status(nuraft::cmd_result_code code);
+    void start_workers();
+    void stop_workers();
+    void proposal_worker();
+    void read_worker();
+    void process_proposal_batch(
+        const std::vector<std::shared_ptr<PendingProposal>>& batch);
+    static RaftCommandResult unavailable_result(std::string detail);
 
     Config config_;
     nuraft::ptr<Logger> logger_;
@@ -91,6 +117,23 @@ private:
     std::unique_ptr<nuraft::raft_launcher> launcher_;
     nuraft::ptr<nuraft::raft_server> server_;
     std::atomic<bool> running_{false};
+
+    std::mutex proposal_mutex_;
+    std::condition_variable proposal_cv_;
+    std::deque<std::shared_ptr<PendingProposal>> proposal_queue_;
+    bool proposal_stopping_{true};
+    std::thread proposal_thread_;
+
+    std::mutex read_mutex_;
+    std::condition_variable read_cv_;
+    std::deque<std::shared_ptr<PendingRead>> read_queue_;
+    bool read_stopping_{true};
+    std::thread read_thread_;
+
+    std::atomic<std::uint64_t> proposal_batches_{0};
+    std::atomic<std::uint64_t> proposal_entries_{0};
+    std::atomic<std::uint64_t> read_batches_{0};
+    std::atomic<std::uint64_t> read_requests_{0};
 };
 
 const char* raft_request_status_name(RaftRequestStatus status) noexcept;

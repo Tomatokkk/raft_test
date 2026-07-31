@@ -101,6 +101,15 @@ void TcpServer::accept_loop() {
             }
             continue;
         }
+        socket->set_option(asio::ip::tcp::no_delay(true), error);
+        if (error) {
+            if (logger_) {
+                logger_->warn(
+                    "cannot enable TCP_NODELAY: " + error.message());
+            }
+            close_socket(socket);
+            continue;
+        }
 
         const auto session_id = next_session_id_.fetch_add(1);
         {

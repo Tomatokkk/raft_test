@@ -37,8 +37,8 @@ struct Config {
     std::int32_t election_timeout_lower_ms{300};
     std::int32_t election_timeout_upper_ms{600};
     std::int32_t client_request_timeout_ms{5000};
-    std::int32_t snapshot_distance{10000};
-    std::int32_t reserved_log_items{1000};
+    std::int32_t snapshot_distance{1000000};
+    std::int32_t reserved_log_items{100000};
 
     std::size_t max_connections{10000};
     std::size_t max_request_size{1024 * 1024};

@@ -88,6 +88,9 @@ target_link_libraries(strongkv-server PRIVATE strongkv_core)
 add_executable(strongkv-cli tools/strongkv-cli/main.cpp)
 target_link_libraries(strongkv-cli PRIVATE strongkv_core)
 
+add_executable(strongkv-benchmark tools/strongkv-benchmark/main.cpp)
+target_link_libraries(strongkv-benchmark PRIVATE strongkv_core)
+
 if(STRONGKV_BUILD_TESTS)
     enable_testing()
     add_executable(strongkv_unit_tests

@@ -38,7 +38,8 @@ The concrete NuRaft APIs used by StrongKV are:
   save_logical_snp_obj,apply_snapshot,free_user_snp_ctx}`;
 - `nuraft::state_mgr::{load_config,save_config,save_state,read_state,
   load_log_store,server_id,system_exit}`;
-- all required `nuraft::log_store` methods, including `compact` and `flush`;
+- all required `nuraft::log_store` methods, including
+  `end_of_append_batch`, `compact`, `flush`, and `last_durable_index`;
 - `nuraft::raft_params` fields for heartbeat/election timeouts,
   `snapshot_distance_`, `reserved_log_items_`, blocking return mode, client
   timeout, and auto-forwarding;
@@ -61,13 +62,13 @@ BCS / strongkv-cli / C++ Client
                 |              |
                 |         serialize Command v1
                 |              |
-                +-----> RaftNode::append()
+                +-----> RaftNode proposal/read batchers
                               |
                          NuRaft quorum
                               |
                     KvStateMachine::commit()
                               |
-                    durable KV state image
+                    in-memory KV + snapshots
 ```
 
 Modules are deliberately separated:
@@ -87,18 +88,20 @@ Modules are deliberately separated:
 command layer.
 
 ```text
-client request
+concurrent client requests
   -> authenticate session
   -> reject/redirect if this node is not leader
   -> validate and serialize Command(version=1, client_id, request_id, ...)
-  -> raft_server::append_entries_ext({buffer}, expected_term) in blocking mode
-  -> NuRaft appends locally and replicates to voting peers
+  -> proposal worker coalesces up to 128 commands for 150 microseconds
+  -> raft_server::append_entries_ext({buffers...}, expected_term)
+  -> append-only WAL writes all frames and fdatasyncs once for the batch
+  -> NuRaft replicates the batch to voting peers
   -> a majority acknowledges
   -> NuRaft advances commit index
-  -> KvStateMachine::commit(log_index, command)
-  -> dedup check, ordered mutation, durable state image
-  -> state-machine result returned by append_entries_ext
-  -> RESP reply returned to client
+  -> KvStateMachine::commit(log_index, command) for every entry
+  -> dedup check and ordered mutation
+  -> results are matched back to requests by log index
+  -> RESP replies returned to clients
 ```
 
 `get_accepted()` only means NuRaft accepted the proposal. StrongKV additionally
@@ -117,12 +120,14 @@ NuRaft v3.0.0 does not expose a public Raft `ReadIndex` API. Merely checking
 `is_leader()` is unsafe: an isolated old leader may not yet know that a
 majority elected a new leader.
 
-StrongKV therefore implements a conservative replicated read barrier:
+StrongKV therefore implements a conservative coalesced replicated read
+barrier:
 
 1. reject a node that is not currently leader;
-2. append an internal `READ_BARRIER` command using NuRaft blocking mode;
-3. wait until that entry is committed and applied by `KvStateMachine`;
-4. read the local KV map only after the barrier succeeds.
+2. collect the currently waiting GETs as one read batch;
+3. append one internal `READ_BARRIER` command using NuRaft blocking mode;
+4. wait until that entry is committed and applied by `KvStateMachine`;
+5. read all keys in the batch under one state-machine lock.
 
 An isolated old leader cannot commit the barrier without a majority and
 therefore cannot return a successful GET. A successful barrier is ordered
@@ -130,11 +135,12 @@ after all preceding writes in the Raft log. The GET is linearized at the
 barrier commit; losing leadership after that point does not invalidate the
 read because later writes may legally linearize after it.
 
-This provides strict linearizable GET semantics, including across leader
-changes and partitions, at the cost of one replicated log entry and quorum
-round trip per GET. It is intentionally slower than lease or ReadIndex reads.
-Replacing it with a verified public ReadIndex mechanism is a future
-optimization, not a correctness fix.
+Only GETs that were already queued before submission share the barrier; later
+GETs go to the next batch. This preserves the ordering argument while turning
+many concurrent reads into one replicated log entry and quorum round trip.
+It remains slower than a verified ReadIndex implementation at low
+concurrency. Replacing it with a verified public ReadIndex mechanism is a
+future optimization, not a correctness fix.
 
 `ROLE` can be served by any node because it is diagnostic. `INFO` describes
 local status. Neither is a KV data read.
@@ -199,12 +205,12 @@ is a documented future operational improvement.
 - NuRaft owns its ASIO Raft transport threads plus commit/append workers.
 - StrongKV uses one owned blocking session thread per accepted client
   connection. Reads and writes on a connection are therefore serialized.
-- A session thread may block in NuRaft blocking append mode. This is
-  acceptable for the correctness-first prototype, but a bounded async worker
-  design is the production follow-up.
+- Session threads enqueue proposals/reads and wait on futures. One proposal
+  worker batches writes and one read worker batches linearizable GETs.
 - `KvStateMachine` protects KV, dedup records, commit index, and snapshot
   metadata with one mutex. Commit order is the NuRaft invocation order.
-- `FileLogStore` protects its in-memory index and disk rewrite with one mutex.
+- `FileLogStore` protects its in-memory index, pending append batch, and
+  append-only WAL descriptor with one mutex.
 - `FileStateManager` serializes config/state writes independently.
 - logging is serialized by its own mutex and never logs passwords or complete
   values.
@@ -230,27 +236,31 @@ data/nodeN/
     latest.bin       NuRaft snapshot metadata + complete state payload
 ```
 
-Durable updates write a temporary file in the same directory, flush and
-`fsync` it, rename over the destination, then `fsync` the directory on Linux.
-Every Raft log append/overwrite is durable before the method returns. The
-implementation rewrites `raft-log.bin`; this is slow but simple and crash-safe for
-a prototype. A production BCS integration should replace the implementation
-behind `nuraft::log_store` with RocksDB or a segmented WAL without changing the
-Raft/state-machine interfaces.
+`raft-log.bin` is a versioned append-only WAL. Each frame contains its log
+index, serialized NuRaft entry, length, and checksum. `append` only stages
+frames in memory; `end_of_append_batch` writes the contiguous bytes and calls
+one `fdatasync`. A torn/corrupt tail is truncated to the last valid frame at
+startup. The legacy whole-file format is migrated automatically. Conflict
+suffix overwrite uses `ftruncate`; snapshot compaction remains a cold-path
+atomic rewrite.
 
-`kv-state.bin` is atomically rewritten after every committed mutation or
-barrier. This means `last_commit_index()` is only advanced together with the
-state it describes. On restart:
+The replicated Raft WAL is the durable source of truth between snapshots.
+`KvStateMachine::commit` mutates memory and records the exact per-index result
+without rewriting the entire KV map. `snapshot/latest.bin` is a complete,
+atomically durable KV + dedup image. `kv-state.bin` is written once on orderly
+shutdown as a fast-start checkpoint, not as a second per-request WAL. On
+restart:
 
 1. `FileStateManager` loads term/vote, committed config, and Raft log;
-2. `KvStateMachine` loads `kv-state.bin` and the latest snapshot metadata;
+2. `KvStateMachine` loads the newest valid checkpoint/snapshot image;
 3. NuRaft starts from those durable indexes and replays any remaining
    committed suffix;
 4. normal election resumes with no configured leader.
 
-Checksums detect torn/corrupt files. Storage errors are fatal to the node:
-continuing with an acknowledged but non-durable Raft state would violate the
-service contract.
+Checksums detect torn/corrupt files. Normal Raft append acknowledgement still
+waits for WAL durability on the leader and quorum path. Storage errors are
+fatal to the node: continuing with an acknowledged but non-durable Raft state
+would violate the service contract.
 
 ## 9. Snapshot and compaction
 
@@ -329,8 +339,9 @@ barrier design, but is reported as untested until such a test is actually run.
 
 ## 13. Known prototype trade-offs
 
-- one full Raft log file rewrite per change and one full KV image per commit;
-- one quorum round trip and log record per GET;
+- snapshot compaction still rewrites the remaining WAL instead of rotating
+  fixed-size segments;
+- one quorum round trip and log record per concurrent GET batch;
 - one dedup record retained per client indefinitely;
 - one operating-system thread per connected client;
 - synchronous SDK sockets currently have no per-operation deadline;
@@ -338,6 +349,14 @@ barrier design, but is reported as untested until such a test is actually run.
   NuRaft membership objects;
 - no client TLS and no Raft TLS configuration in the first prototype;
 - no Redis TTL, transactions, scripting, Pub/Sub, sharding, or complex types.
+
+NuRaft v3.0.0's experimental `parallel_log_appending` was evaluated but is not
+enabled: under leader-crash testing, a newly elected leader could append a
+barrier without completing replication to the remaining follower. The safe
+implementation retains blocking NuRaft completion and durable
+`end_of_append_batch`. A future pipelined design must include verified
+role-transition, RPC cancellation, quorum durability, and repeated
+kill/restart tests rather than merely toggling the experimental flag.
 
 These choices reduce implementation surface without weakening acknowledged
 write durability or KV consistency.

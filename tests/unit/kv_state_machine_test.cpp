@@ -124,6 +124,7 @@ SKV_TEST(state_machine_recovers_kv_and_dedup_from_disk) {
                command(CommandType::kSet, "key", "value", 9, 1));
         commit(machine, 2,
                command(CommandType::kIncr, "counter", {}, 9, 2));
+        machine.checkpoint();
     }
     {
         KvStateMachine reopened(
@@ -137,4 +138,21 @@ SKV_TEST(state_machine_recovers_kv_and_dedup_from_disk) {
         SKV_EXPECT_EQ(retry.integer, std::int64_t{1});
         SKV_EXPECT_EQ(reopened.get("counter").value(), std::string("1"));
     }
+}
+
+SKV_TEST(state_machine_exposes_each_batched_commit_result_once) {
+    StateFixture fixture;
+    KvStateMachine machine(
+        fixture.root / "state", fixture.root / "snapshot", 1024 * 1024);
+
+    commit(machine, 7, command(CommandType::kSet, "key", "value"));
+    commit(machine, 8, command(CommandType::kDel, "missing"));
+
+    const auto set_result = machine.take_result(7);
+    const auto del_result = machine.take_result(8);
+    SKV_EXPECT_TRUE(set_result.has_value());
+    SKV_EXPECT_TRUE(del_result.has_value());
+    SKV_EXPECT_EQ(set_result->code, ResultCode::kOk);
+    SKV_EXPECT_EQ(del_result->integer, std::int64_t{0});
+    SKV_EXPECT_TRUE(!machine.take_result(7).has_value());
 }

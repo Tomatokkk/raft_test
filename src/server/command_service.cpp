@@ -289,6 +289,10 @@ std::string CommandService::info_response() const {
            << "last_applied:" << raft.last_applied << "\r\n"
            << "snapshot_index:" << raft.snapshot_index << "\r\n"
            << "cluster_size:" << raft.cluster_size << "\r\n"
+           << "proposal_batches:" << raft.proposal_batches << "\r\n"
+           << "proposal_entries:" << raft.proposal_entries << "\r\n"
+           << "read_batches:" << raft.read_batches << "\r\n"
+           << "read_requests:" << raft.read_requests << "\r\n"
            << "client_connections:" << client_connections() << "\r\n"
            << "uptime_seconds:" << uptime << "\r\n";
     return encode_bulk_string(output.str());

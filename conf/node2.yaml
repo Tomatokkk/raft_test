@@ -29,11 +29,11 @@ raft:
   election_timeout_lower_ms: 300
   election_timeout_upper_ms: 600
   client_request_timeout_ms: 5000
-  snapshot_distance: 100
-  reserved_log_items: 20
+  snapshot_distance: 1000000
+  reserved_log_items: 100000
 server:
   max_connections: 10000
   max_request_size: 1048576
 logging:
-  level: info
+  level: warn
   path: ./logs/node2.log

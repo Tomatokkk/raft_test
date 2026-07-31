@@ -255,10 +255,16 @@ Intentionally not implemented:
 
 ## 14. Known risks and BCS follow-up
 
-- The correctness-first file store rewrites complete files and fsyncs every
-  commit. Replace it with RocksDB or a segmented WAL before high-QPS use.
-- Every GET adds a committed log entry. Replace only after a supported,
-  verified ReadIndex/lease-read design is available.
+- Normal Raft appends now use a checksummed append-only WAL and one fdatasync
+  per NuRaft batch. Snapshot compaction still rewrites the remaining file;
+  replace it with fixed-size segment rotation before long-running high-QPS
+  production use.
+- Concurrent GETs share a committed barrier, but every read batch still adds
+  a log entry. Replace only after a supported, verified ReadIndex/lease-read
+  design is available.
+- NuRaft v3.0.0 experimental parallel log appending failed the leader-crash
+  verification and is deliberately not exposed. Do not enable it without
+  repeated role-transition and quorum-durability testing.
 - The server uses one OS thread per connection. Replace it with bounded async
   I/O before large connection counts.
 - SDK synchronous sockets have no operation deadline. Add connect/read/write

@@ -16,6 +16,11 @@ namespace strongkv {
 namespace {
 
 constexpr auto kInitializationTimeout = std::chrono::seconds(10);
+constexpr std::size_t kMaximumProposalBatch = 128;
+constexpr auto kProposalBatchDelay =
+    std::chrono::microseconds(150);
+constexpr std::size_t kMaximumReadBatch = 4096;
+constexpr auto kReadBatchDelay = std::chrono::microseconds(50);
 
 std::string role_description(bool leader) {
     return leader ? "LEADER" : "FOLLOWER";
@@ -66,6 +71,8 @@ void RaftNode::start() {
     params.client_req_timeout_ = config_.client_request_timeout_ms;
     params.snapshot_distance_ = config_.snapshot_distance;
     params.reserved_log_items_ = config_.reserved_log_items;
+    params.max_append_size_ = 256;
+    params.use_bg_thread_for_urgent_commit_ = false;
     params.return_method_ = nuraft::raft_params::blocking;
     params.auto_forwarding_ = false;
 
@@ -110,6 +117,7 @@ void RaftNode::start() {
     }
 
     running_.store(true);
+    start_workers();
     logger_->info("NuRaft initialized node_id=" +
                   std::to_string(config_.node_id));
 }
@@ -122,9 +130,13 @@ void RaftNode::stop() {
     running_.store(false);
     logger_->info("stopping NuRaft node_id=" +
                   std::to_string(config_.node_id));
+    stop_workers();
     const bool graceful = launcher_->shutdown(10);
     if (log_store_) {
         log_store_->flush();
+    }
+    if (state_machine_) {
+        state_machine_->checkpoint();
     }
     server_.reset();
     launcher_.reset();
@@ -136,7 +148,34 @@ void RaftNode::stop() {
 }
 
 RaftCommandResult RaftNode::submit(const Command& command) {
-    RaftCommandResult output;
+    auto server = server_;
+    if (!running_.load() || !server || !server->is_initialized()) {
+        return unavailable_result("Raft node is not ready");
+    }
+    if (!server->is_leader()) {
+        RaftCommandResult output;
+        output.status = RaftRequestStatus::kNotLeader;
+        output.detail = "this node is not leader";
+        return output;
+    }
+
+    auto pending = std::make_shared<PendingProposal>();
+    pending->command = command;
+    auto result = pending->completion.get_future();
+    {
+        std::lock_guard<std::mutex> lock(proposal_mutex_);
+        if (proposal_stopping_ || !running_.load()) {
+            return unavailable_result("Raft proposal worker is stopping");
+        }
+        proposal_queue_.push_back(pending);
+    }
+    proposal_cv_.notify_one();
+    return result.get();
+}
+
+LinearizableGetResult RaftNode::linearizable_get(
+        const std::string& key) {
+    LinearizableGetResult output;
     auto server = server_;
     if (!running_.load() || !server || !server->is_initialized()) {
         output.detail = "Raft node is not ready";
@@ -148,70 +187,275 @@ RaftCommandResult RaftNode::submit(const Command& command) {
         return output;
     }
 
-    const auto term = server->get_term();
-    nuraft::raft_server::req_ext_params ext;
-    ext.expected_term_ = term;
-    std::vector<nuraft::ptr<nuraft::buffer>> logs{
-        encode_command(command)};
-    auto result = server->append_entries_ext(logs, ext);
-    if (!result) {
-        output.status = RaftRequestStatus::kUnavailable;
-        output.detail = "NuRaft returned no command result";
-        return output;
+    auto pending = std::make_shared<PendingRead>();
+    pending->key = key;
+    auto result = pending->completion.get_future();
+    {
+        std::lock_guard<std::mutex> lock(read_mutex_);
+        if (read_stopping_ || !running_.load()) {
+            output.detail = "linearizable read worker is stopping";
+            return output;
+        }
+        read_queue_.push_back(pending);
     }
-    if (!result->get_accepted()) {
-        output.status = map_status(result->get_result_code());
-        output.detail = result->get_result_str();
-        return output;
-    }
-
-    const auto code = result->get_result_code();
-    output.status = map_status(code);
-    if (code != nuraft::cmd_result_code::OK) {
-        output.detail = result->get_result_str();
-        return output;
-    }
-    auto committed = result->get();
-    if (!committed) {
-        output.status = RaftRequestStatus::kUnavailable;
-        output.detail = "committed entry has no state-machine result";
-        return output;
-    }
-
-    try {
-        output.result =
-            decode_result(*committed, config_.max_request_size);
-        output.status = RaftRequestStatus::kOk;
-    } catch (const std::exception& error) {
-        output.status = RaftRequestStatus::kUnavailable;
-        output.detail =
-            std::string("invalid state-machine result: ") + error.what();
-        logger_->err(output.detail);
-    }
-    return output;
+    read_cv_.notify_one();
+    return result.get();
 }
 
-LinearizableGetResult RaftNode::linearizable_get(
-        const std::string& key) {
-    LinearizableGetResult output;
-    Command barrier;
-    barrier.type = CommandType::kReadBarrier;
-    const auto barrier_result = submit(barrier);
-    output.status = barrier_result.status;
-    output.detail = barrier_result.detail;
-    if (barrier_result.status != RaftRequestStatus::kOk) {
-        return output;
+void RaftNode::start_workers() {
+    {
+        std::lock_guard<std::mutex> lock(proposal_mutex_);
+        proposal_stopping_ = false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(read_mutex_);
+        read_stopping_ = false;
+    }
+    proposal_thread_ =
+        std::thread(&RaftNode::proposal_worker, this);
+    read_thread_ = std::thread(&RaftNode::read_worker, this);
+}
+
+void RaftNode::stop_workers() {
+    std::deque<std::shared_ptr<PendingRead>> rejected_reads;
+    std::deque<std::shared_ptr<PendingProposal>> rejected_proposals;
+    {
+        std::lock_guard<std::mutex> lock(read_mutex_);
+        read_stopping_ = true;
+        rejected_reads.swap(read_queue_);
+    }
+    read_cv_.notify_all();
+    for (auto& pending : rejected_reads) {
+        LinearizableGetResult result;
+        result.detail = "Raft node is stopping";
+        pending->completion.set_value(std::move(result));
     }
 
-    // The barrier was committed by a majority in the current term before
-    // this local read. An isolated former leader cannot complete it.
-    auto state_machine = state_machine_;
-    if (!state_machine) {
-        output.status = RaftRequestStatus::kUnavailable;
-        output.detail = "state machine is unavailable";
-        return output;
+    {
+        std::lock_guard<std::mutex> lock(proposal_mutex_);
+        proposal_stopping_ = true;
+        rejected_proposals.swap(proposal_queue_);
     }
-    output.value = state_machine->get(key);
+    proposal_cv_.notify_all();
+    for (auto& pending : rejected_proposals) {
+        pending->completion.set_value(
+            unavailable_result("Raft node is stopping"));
+    }
+
+    if (read_thread_.joinable()) {
+        read_thread_.join();
+    }
+    if (proposal_thread_.joinable()) {
+        proposal_thread_.join();
+    }
+}
+
+void RaftNode::proposal_worker() {
+    for (;;) {
+        std::vector<std::shared_ptr<PendingProposal>> batch;
+        {
+            std::unique_lock<std::mutex> lock(proposal_mutex_);
+            proposal_cv_.wait(lock, [this] {
+                return proposal_stopping_ || !proposal_queue_.empty();
+            });
+            if (proposal_stopping_ && proposal_queue_.empty()) {
+                return;
+            }
+
+            const auto deadline =
+                std::chrono::steady_clock::now() +
+                kProposalBatchDelay;
+            while (!proposal_stopping_ &&
+                   proposal_queue_.size() < kMaximumProposalBatch &&
+                   proposal_cv_.wait_until(lock, deadline) !=
+                       std::cv_status::timeout) {
+            }
+            const auto count = std::min(
+                proposal_queue_.size(), kMaximumProposalBatch);
+            batch.reserve(count);
+            for (std::size_t index = 0; index < count; ++index) {
+                batch.push_back(std::move(proposal_queue_.front()));
+                proposal_queue_.pop_front();
+            }
+        }
+        process_proposal_batch(batch);
+    }
+}
+
+void RaftNode::process_proposal_batch(
+        const std::vector<std::shared_ptr<PendingProposal>>& batch) {
+    if (batch.empty()) {
+        return;
+    }
+    proposal_batches_.fetch_add(1, std::memory_order_relaxed);
+    proposal_entries_.fetch_add(
+        static_cast<std::uint64_t>(batch.size()),
+        std::memory_order_relaxed);
+    auto fail_all = [&batch](RaftCommandResult failure) {
+        for (const auto& pending : batch) {
+            pending->completion.set_value(failure);
+        }
+    };
+
+    auto server = server_;
+    auto state_machine = state_machine_;
+    if (!server || !state_machine || !server->is_initialized()) {
+        fail_all(unavailable_result("Raft node is not ready"));
+        return;
+    }
+    if (!server->is_leader()) {
+        RaftCommandResult failure;
+        failure.status = RaftRequestStatus::kNotLeader;
+        failure.detail = "this node is not leader";
+        fail_all(std::move(failure));
+        return;
+    }
+
+    std::vector<nuraft::ptr<nuraft::buffer>> logs;
+    logs.reserve(batch.size());
+    try {
+        for (const auto& pending : batch) {
+            logs.push_back(encode_command(pending->command));
+        }
+    } catch (const std::exception& error) {
+        RaftCommandResult failure;
+        failure.status = RaftRequestStatus::kRejected;
+        failure.detail =
+            std::string("command encoding failed: ") + error.what();
+        fail_all(std::move(failure));
+        return;
+    }
+
+    std::vector<nuraft::ulong> log_indexes;
+    log_indexes.reserve(batch.size());
+    nuraft::raft_server::req_ext_params ext;
+    ext.expected_term_ = server->get_term();
+    ext.after_precommit_ =
+        [&log_indexes](
+            const nuraft::raft_server::req_ext_cb_params& params) {
+            log_indexes.push_back(params.log_idx);
+        };
+
+    auto result = server->append_entries_ext(logs, ext);
+    if (!result) {
+        fail_all(unavailable_result(
+            "NuRaft returned no command result"));
+        return;
+    }
+    if (!result->get_accepted()) {
+        RaftCommandResult failure;
+        failure.status = map_status(result->get_result_code());
+        failure.detail = result->get_result_str();
+        fail_all(std::move(failure));
+        return;
+    }
+
+    const auto committed = result->get();
+    const auto code = result->get_result_code();
+    if (code != nuraft::cmd_result_code::OK || !committed) {
+        RaftCommandResult failure;
+        failure.status = map_status(code);
+        failure.detail = result->get_result_str();
+        if (failure.detail.empty() && !committed) {
+            failure.detail =
+                "committed batch has no state-machine result";
+        }
+        fail_all(std::move(failure));
+        return;
+    }
+    if (log_indexes.size() != batch.size()) {
+        fail_all(unavailable_result(
+            "NuRaft returned incomplete batch indexes"));
+        return;
+    }
+
+    for (std::size_t index = 0; index < batch.size(); ++index) {
+        RaftCommandResult output;
+        auto applied = state_machine->take_result(log_indexes[index]);
+        if (!applied) {
+            output = unavailable_result(
+                "state-machine result cache missed committed index " +
+                std::to_string(log_indexes[index]));
+        } else {
+            output.status = RaftRequestStatus::kOk;
+            output.result = std::move(*applied);
+        }
+        batch[index]->completion.set_value(std::move(output));
+    }
+}
+
+void RaftNode::read_worker() {
+    for (;;) {
+        std::vector<std::shared_ptr<PendingRead>> batch;
+        {
+            std::unique_lock<std::mutex> lock(read_mutex_);
+            read_cv_.wait(lock, [this] {
+                return read_stopping_ || !read_queue_.empty();
+            });
+            if (read_stopping_ && read_queue_.empty()) {
+                return;
+            }
+            const auto deadline =
+                std::chrono::steady_clock::now() + kReadBatchDelay;
+            while (!read_stopping_ &&
+                   read_queue_.size() < kMaximumReadBatch &&
+                   read_cv_.wait_until(lock, deadline) !=
+                       std::cv_status::timeout) {
+            }
+            const auto count =
+                std::min(read_queue_.size(), kMaximumReadBatch);
+            batch.reserve(count);
+            for (std::size_t index = 0; index < count; ++index) {
+                batch.push_back(std::move(read_queue_.front()));
+                read_queue_.pop_front();
+            }
+        }
+
+        Command barrier;
+        barrier.type = CommandType::kReadBarrier;
+        read_batches_.fetch_add(1, std::memory_order_relaxed);
+        read_requests_.fetch_add(
+            static_cast<std::uint64_t>(batch.size()),
+            std::memory_order_relaxed);
+        const auto barrier_result = submit(barrier);
+        if (barrier_result.status != RaftRequestStatus::kOk) {
+            for (const auto& pending : batch) {
+                LinearizableGetResult output;
+                output.status = barrier_result.status;
+                output.detail = barrier_result.detail;
+                pending->completion.set_value(std::move(output));
+            }
+            continue;
+        }
+
+        auto state_machine = state_machine_;
+        if (!state_machine) {
+            for (const auto& pending : batch) {
+                LinearizableGetResult output;
+                output.detail = "state machine is unavailable";
+                pending->completion.set_value(std::move(output));
+            }
+            continue;
+        }
+        std::vector<std::string> keys;
+        keys.reserve(batch.size());
+        for (const auto& pending : batch) {
+            keys.push_back(pending->key);
+        }
+        auto values = state_machine->get_many(keys);
+        for (std::size_t index = 0; index < batch.size(); ++index) {
+            LinearizableGetResult output;
+            output.status = RaftRequestStatus::kOk;
+            output.value = std::move(values[index]);
+            batch[index]->completion.set_value(std::move(output));
+        }
+    }
+}
+
+RaftCommandResult RaftNode::unavailable_result(
+        std::string detail) {
+    RaftCommandResult output;
+    output.detail = std::move(detail);
     return output;
 }
 
@@ -258,6 +502,14 @@ RaftNodeInfo RaftNode::info() const {
     std::vector<nuraft::ptr<nuraft::srv_config>> servers;
     server->get_srv_config_all(servers);
     output.cluster_size = servers.size();
+    output.proposal_batches =
+        proposal_batches_.load(std::memory_order_relaxed);
+    output.proposal_entries =
+        proposal_entries_.load(std::memory_order_relaxed);
+    output.read_batches =
+        read_batches_.load(std::memory_order_relaxed);
+    output.read_requests =
+        read_requests_.load(std::memory_order_relaxed);
     return output;
 }
 

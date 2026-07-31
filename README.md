@@ -13,7 +13,8 @@ SDK 和测试工具。
 - `AUTH / SET / GET / DEL / INCR / DECR / PING / INFO / ROLE`
 - 三个 voting members，自动选主和 Leader 故障切换
 - 写入只在 NuRaft quorum commit 后进入 `KvStateMachine::commit`
-- GET 先提交 `READ_BARRIER`，防止隔离的旧 Leader 返回陈旧数据
+- 并发 GET 合并提交一个 `READ_BARRIER`，防止隔离的旧 Leader 返回陈旧数据
+- 写提案自动合批；Raft WAL 追加写并在每批末尾执行一次 `fdatasync`
 - 持久化 Raft log、term/vote、cluster config、KV 和去重状态
 - NuRaft logical snapshot、落后节点 snapshot 恢复和旧日志裁剪
 - RESP2 半包/粘包/多请求/大小限制
@@ -145,9 +146,15 @@ data/nodeN/
 logs/nodeN.log
 ```
 
-文件带版本、长度和 checksum。更新采用同目录临时文件、fsync、原子 rename
-以及目录 fsync。原型为了简单，每次更新重写完整日志/状态文件，正确性优先，
-不适合高 QPS 生产负载；生产版建议保持接口不变，替换为 RocksDB 或分段 WAL。
+文件带版本、长度和 checksum。正常 Raft append 采用追加式 WAL：一个 NuRaft
+批次编码多条 frame，只在 `end_of_append_batch` 做一次 `fdatasync`。崩溃恢复会
+校验每条 frame 并截断不完整尾部；旧版整文件格式会在首次启动时自动迁移。
+日志冲突覆盖和 snapshot compaction 是低频路径，仍使用截断或原子整文件重写。
+
+KV map 不再在每次 commit 后整库写盘。多数派 Raft WAL 是 snapshot 之间的耐久
+事实来源；`latest.bin` 保存完整 KV/去重状态，`kv-state.bin` 只在正常停机时作为
+快速启动检查点。崩溃后从最新检查点/snapshot 加载，再由 NuRaft 回放剩余已提交
+日志。不要通过关闭 WAL `fdatasync` 获取虚假吞吐。
 
 ## Snapshot 与日志裁剪
 
@@ -180,6 +187,27 @@ STRONGKV_BUILD_DIR="$PWD/build" ./scripts/failover_test.sh
 
 脚本运行后需要用 `start_cluster.sh` 恢复被终止节点。
 
+### 性能基准
+
+项目自带固定连接数的混合负载工具，避免只看客户端手工 `SET` 延迟：
+
+```bash
+./build/strongkv-benchmark \
+  "$STRONGKV_PASSWORD" \
+  300 1000 90 256 \
+  127.0.0.1:7401 127.0.0.1:7402 127.0.0.1:7403
+```
+
+参数依次是：密码、连接数、每连接操作数、GET 百分比、value 字节数、seed
+列表。输出包含总操作数、秒数和 QPS。压测前确认连接的是当前 Leader，使用
+Release 构建、独立数据目录，并保持 `logging.level: warn`。`INFO` 中的
+`proposal_batches/proposal_entries` 和 `read_batches/read_requests` 可用于确认
+写合批及读屏障合并是否生效。
+
+性能数字必须同时记录 CPU、磁盘、三进程是否共盘、连接数、读写比例、value
+大小和 snapshot 配置。本仓库不会承诺与硬件无关的固定 QPS；强一致模式不会
+用关闭多数派耐久写来换分数。
+
 ## 常见错误
 
 - `NOAUTH`：先执行 AUTH，或 CLI 使用 `-a`。
@@ -196,3 +224,6 @@ STRONGKV_BUILD_DIR="$PWD/build" ./scripts/failover_test.sh
 当前没有 TTL、事务、Lua、Pub/Sub、分片、Multi-Raft、客户端 TLS 或在线成员
 管理。客户端服务目前每连接一个线程，SDK 同步 socket 也没有单操作 deadline；
 它们是生产化前需要替换的容量与运维能力，不影响已确认请求的 Raft 安全语义。
+NuRaft v3.0.0 的 experimental `parallel_log_appending` 在本项目故障切换压测中
+未通过，因此没有启用或暴露；进一步提升到 braft 级流水线吞吐需要先完成并验证
+角色切换、RPC 取消和多数派耐久边界，不能只打开实验开关。
