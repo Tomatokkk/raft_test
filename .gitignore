@@ -1,0 +1,10 @@
+build*/
+bin/
+data/
+logs/
+run/
+.cache/
+*.pid
+*.tmp
+*.swp
+CTestTestfile.cmake

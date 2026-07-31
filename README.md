@@ -61,6 +61,7 @@ cmake --build build -j
 
 ```bash
 export STRONGKV_BUILD_DIR="$PWD/build"
+export STRONGKV_PASSWORD='replace-with-a-secret'
 ./scripts/start_cluster.sh
 ./scripts/status_cluster.sh
 ```
@@ -75,7 +76,8 @@ export STRONGKV_BUILD_DIR="$PWD/build"
 `127.0.0.1` 改为各机器真实地址，三个配置的 `cluster.nodes` 必须一致；
 `network.bind` 可以保持 `0.0.0.0`。不要把 Leader 写死在配置中。
 
-示例密码 `strong123` 只用于本地测试，部署前必须更换，并限制配置文件权限。
+三个示例配置从环境变量 `STRONGKV_PASSWORD` 读取密码，不在仓库中保存明文密钥。
+启动前请从安全的密钥来源设置该变量，并限制进程环境和配置文件的访问权限。
 
 ## CLI
 
@@ -86,16 +88,16 @@ export STRONGKV_BUILD_DIR="$PWD/build"
   --seed 127.0.0.1:7401 \
   --seed 127.0.0.1:7402 \
   --seed 127.0.0.1:7403 \
-  -a strong123 SET a 1
+  -a "$STRONGKV_PASSWORD" SET a 1
 
-./build/strongkv-cli --seed 127.0.0.1:7402 -a strong123 GET a
+./build/strongkv-cli --seed 127.0.0.1:7402 -a "$STRONGKV_PASSWORD" GET a
 ```
 
 交互模式：
 
 ```bash
 ./build/strongkv-cli -h 127.0.0.1 -p 7401
-strongkv> AUTH strong123
+strongkv> AUTH <password-from-your-secret-store>
 strongkv> SET a 1
 strongkv> GET a
 strongkv> INCR a
@@ -118,7 +120,7 @@ strongkv::Client client({
     "127.0.0.1:7403",
 });
 client.connect();
-client.auth("strong123");
+client.auth(password_from_secret_store);
 client.set("counter", "10");
 auto value = client.incr("counter");  // 11
 ```
