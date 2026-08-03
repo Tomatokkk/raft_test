@@ -13,7 +13,8 @@ SDK 和测试工具。
 - `AUTH / SET / GET / DEL / INCR / DECR / PING / INFO / ROLE`
 - 三个 voting members，自动选主和 Leader 故障切换
 - 写入只在 NuRaft quorum commit 后进入 `KvStateMachine::commit`
-- 并发 GET 合并提交一个 `READ_BARRIER`，防止隔离的旧 Leader 返回陈旧数据
+- GET 优先使用多数派心跳租约快路径；租约不满足时自动退回合并的
+  `READ_BARRIER`，隔离的旧 Leader 不会返回陈旧数据
 - 写提案自动合批；Raft WAL 追加写并在每批末尾执行一次 `fdatasync`
 - 持久化 Raft log、term/vote、cluster config、KV 和去重状态
 - NuRaft logical snapshot、落后节点 snapshot 恢复和旧日志裁剪
@@ -201,8 +202,16 @@ STRONGKV_BUILD_DIR="$PWD/build" ./scripts/failover_test.sh
 参数依次是：密码、连接数、每连接操作数、GET 百分比、value 字节数、seed
 列表。输出包含总操作数、秒数和 QPS。压测前确认连接的是当前 Leader，使用
 Release 构建、独立数据目录，并保持 `logging.level: warn`。`INFO` 中的
-`proposal_batches/proposal_entries` 和 `read_batches/read_requests` 可用于确认
-写合批及读屏障合并是否生效。
+`proposal_batches/proposal_entries`、`lease_reads` 和
+`read_batches/read_requests` 可用于确认写合批、Lease Read 及屏障回退是否生效。
+
+Lease Read 仍是线性一致读，不是本地弱一致读。Leader 只有在当前任期的首个
+configuration entry 已提交并应用、且一个 voting quorum 在保守租约窗口内有响应时
+才直接读取状态机；请求前后都会复核任期和租约。租约窗口为 election lower bound
+减去一个 heartbeat，NuRaft 的 `leadership_expiry_` 同时限制为 election lower bound。
+租约依赖各节点单调时钟速率偏差有界；如果部署环境不能满足这个标准的 Lease Read
+假设，应在三个节点配置中统一设置 `raft.enable_lease_reads: false`，强制使用
+`READ_BARRIER` 路径。
 
 性能数字必须同时记录 CPU、磁盘、三进程是否共盘、连接数、读写比例、value
 大小和 snapshot 配置。本仓库不会承诺与硬件无关的固定 QPS；强一致模式不会

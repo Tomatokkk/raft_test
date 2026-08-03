@@ -53,12 +53,14 @@ See `docs/design.md` for the full request and recovery paths.
 - `raft_server::append_entries_ext`
 - `raft_server::{is_initialized,is_leader,get_leader,get_term}`
 - `raft_server::{get_committed_log_idx,get_last_log_idx}`
-- `raft_server::{get_last_snapshot_idx,get_srv_config_all}`
+- `raft_server::{get_log_idx_at_becoming_leader,get_peer_info_all}`
+- `raft_server::{get_last_snapshot_idx,get_srv_config,get_srv_config_all}`
 - `state_machine` commit/config/snapshot logical-object callbacks
 - the complete `state_mgr` persistence interface
 - the complete `log_store` interface, including `compact` and `flush`
-- `raft_params` heartbeat, election, client timeout, snapshot distance,
-  reserved items, blocking return, and disabled auto-forwarding
+- `raft_params` heartbeat, election, leadership expiry, client timeout,
+  snapshot distance, reserved items, blocking return, and disabled
+  auto-forwarding
 - `cb_func` role/config/snapshot notifications
 
 Election, voting, replication, quorum computation, peer RPC, logical snapshot
@@ -85,17 +87,19 @@ NuRaft result `OK` and a valid state-machine response.
 
 ## 5. Linearizable GET
 
-NuRaft v3.0.0 has no public ReadIndex API. GET is leader-only and first
-commits an internal `READ_BARRIER` in the current term using
-`append_entries_ext`. Only after the blocking commit and apply succeeds does
-the node read its local state machine. An isolated former leader has no
-majority and cannot complete this barrier, so it cannot return a successful
-stale GET.
+NuRaft v3.0.0 has no public ReadIndex API. GET is leader-only and uses a
+quorum-backed lease only after the current-term leader configuration entry is
+committed/applied and a voting quorum has responded within election-lower
+minus one heartbeat. Role, term, and lease are checked both before and after
+the state read. NuRaft leadership expiry is bounded by election-lower. If any
+condition fails, GET commits a coalesced internal `READ_BARRIER` before reading
+the state machine.
 
-This is implemented and exercised through normal reads and reads after two
-leader changes. A strict firewall partition was not injected, so the
-partition-specific claim remains reasoning-backed but not experimentally
-verified in this run.
+The lease path was exercised with a paused Leader process: the other two
+voters elected Node2 in term 2 and committed `after`; after the old Leader was
+resumed, a raw RESP client connected directly to its old client port received
+`NOT_LEADER 127.0.0.1 17402`, not its stale `before` value. This test disables
+SDK redirect handling so rejection by the old node is observable.
 
 ## 6. Leader failover
 
@@ -216,11 +220,13 @@ dependency path.
 
 Implemented and passed:
 
-- 19 unit test cases inside `strongkv_unit_tests`
+- 20 unit test cases inside `strongkv_unit_tests`
 - one leader and two followers
 - SET/GET/DEL/nil
 - INCR/DECR and int64 boundary errors
 - follower read/write redirect
+- lease read quorum/term checks plus committed-barrier fallback
+- paused-old-Leader rejection using a raw non-redirecting RESP request
 - two leader failure/election sequences
 - failed leader restart and index catch-up
 - full-cluster stop/restart recovery
@@ -232,6 +238,20 @@ Implemented and passed:
 - startup/status/shutdown/integration/failover scripts
 - SIGTERM graceful shutdown of all three nodes with
   `NuRaft stopped, graceful=true`
+
+Release benchmark on one Windows/WSL host with three StrongKV processes
+sharing the same virtual disk, 300 connections, 90% GET / 10% SET, and
+256-byte values produced three consecutive results:
+
+```text
+79,618 ops/s
+73,694 ops/s
+61,427 ops/s
+```
+
+All 90,480 GETs in the first run used the verified lease path; no read barrier
+was needed. A 200-connection, 100% SET run reached 15,226 ops/s. These are
+environment-specific measurements, not a hardware-independent guarantee.
 
 The final VM state after verification has no StrongKV server processes
 running. Persistent test data remains under `/root/strongkv-src/data`.
@@ -259,9 +279,10 @@ Intentionally not implemented:
   per NuRaft batch. Snapshot compaction still rewrites the remaining file;
   replace it with fixed-size segment rotation before long-running high-QPS
   production use.
-- Concurrent GETs share a committed barrier, but every read batch still adds
-  a log entry. Replace only after a supported, verified ReadIndex/lease-read
-  design is available.
+- Lease reads avoid a log entry in the steady state and fall back to a
+  committed coalesced barrier. Lease safety assumes bounded monotonic-clock
+  rate error; set `raft.enable_lease_reads: false` on every member where that
+  assumption is invalid.
 - NuRaft v3.0.0 experimental parallel log appending failed the leader-crash
   verification and is deliberately not exposed. Do not enable it without
   repeated role-transition and quorum-durability testing.

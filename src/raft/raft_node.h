@@ -60,6 +60,7 @@ struct RaftNodeInfo {
     std::uint64_t proposal_entries{0};
     std::uint64_t read_batches{0};
     std::uint64_t read_requests{0};
+    std::uint64_t lease_reads{0};
 };
 
 // Owns the NuRaft launcher and exposes only operations with service-level
@@ -105,6 +106,9 @@ private:
     void read_worker();
     void process_proposal_batch(
         const std::vector<std::shared_ptr<PendingProposal>>& batch);
+    bool has_valid_read_lease(
+        const nuraft::ptr<nuraft::raft_server>& server,
+        std::uint64_t expected_term) const;
     static RaftCommandResult unavailable_result(std::string detail);
 
     Config config_;
@@ -134,6 +138,7 @@ private:
     std::atomic<std::uint64_t> proposal_entries_{0};
     std::atomic<std::uint64_t> read_batches_{0};
     std::atomic<std::uint64_t> read_requests_{0};
+    std::atomic<std::uint64_t> lease_reads_{0};
 };
 
 const char* raft_request_status_name(RaftRequestStatus status) noexcept;

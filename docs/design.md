@@ -32,6 +32,7 @@ The concrete NuRaft APIs used by StrongKV are:
 - `nuraft::raft_server::append_entries_ext`, `is_leader`, `get_leader`,
   `get_term`, `get_last_log_idx`, `get_committed_log_idx`,
   `get_log_idx_at_becoming_leader`, `get_srv_config_all`,
+  `get_srv_config`, `get_peer_info_all`,
   `get_last_snapshot_idx`, and `is_initialized`;
 - `nuraft::state_machine::{commit,commit_config,last_commit_index,
   create_snapshot,last_snapshot,read_logical_snp_obj,
@@ -42,7 +43,7 @@ The concrete NuRaft APIs used by StrongKV are:
   `end_of_append_batch`, `compact`, `flush`, and `last_durable_index`;
 - `nuraft::raft_params` fields for heartbeat/election timeouts,
   `snapshot_distance_`, `reserved_log_items_`, blocking return mode, client
-  timeout, and auto-forwarding;
+  timeout, leadership expiry, and auto-forwarding;
 - `nuraft::cb_func` role and snapshot callbacks.
 
 ## 2. Architecture
@@ -120,27 +121,40 @@ NuRaft v3.0.0 does not expose a public Raft `ReadIndex` API. Merely checking
 `is_leader()` is unsafe: an isolated old leader may not yet know that a
 majority elected a new leader.
 
-StrongKV therefore implements a conservative coalesced replicated read
-barrier:
+StrongKV uses a quorum-backed leader lease fast path and retains the
+conservative coalesced replicated barrier as a fallback:
 
 1. reject a node that is not currently leader;
-2. collect the currently waiting GETs as one read batch;
-3. append one internal `READ_BARRIER` command using NuRaft blocking mode;
-4. wait until that entry is committed and applied by `KvStateMachine`;
-5. read all keys in the batch under one state-machine lock.
+2. require NuRaft's current-term configuration entry from
+   `get_log_idx_at_becoming_leader()` to be committed and applied;
+3. require responses from a voting quorum inside a conservative freshness
+   window: election lower bound minus one heartbeat;
+4. read the state machine, then re-check role, term, and quorum freshness;
+5. if any lease condition fails, discard the local result and enqueue the GET
+   for a coalesced committed `READ_BARRIER`.
 
-An isolated old leader cannot commit the barrier without a majority and
-therefore cannot return a successful GET. A successful barrier is ordered
-after all preceding writes in the Raft log. The GET is linearized at the
-barrier commit; losing leadership after that point does not invalidate the
-read because later writes may legally linearize after it.
+NuRaft `leadership_expiry_` is set to the election lower bound. NuRaft's
+pre-vote/leadership-expiration design states that expiry at or below that
+bound avoids an overlap between an old and new leader. The additional
+one-heartbeat margin ensures the local fast path stops earlier. Like standard
+lease reads in other Raft systems, safety assumes bounded monotonic-clock rate
+error between voting members. Environments unable to make that assumption
+must set `raft.enable_lease_reads: false` on every member and use the barrier
+path instead of the lease fast path.
+
+An isolated old leader quickly loses quorum freshness and cannot pass the
+post-read lease check. It also cannot commit the fallback barrier without a
+majority, so it cannot return a successful stale GET. A successful barrier is
+ordered after all preceding writes in the Raft log and is linearized at its
+commit. A lease read is linearized while the state-machine lock is held inside
+the verified lease interval.
 
 Only GETs that were already queued before submission share the barrier; later
 GETs go to the next batch. This preserves the ordering argument while turning
 many concurrent reads into one replicated log entry and quorum round trip.
-It remains slower than a verified ReadIndex implementation at low
-concurrency. Replacing it with a verified public ReadIndex mechanism is a
-future optimization, not a correctness fix.
+The barrier remains available for election, heartbeat jitter, or quorum-loss
+windows. `INFO` exposes `lease_reads`, `read_batches`, and `read_requests` so
+operators can distinguish the fast and fallback paths.
 
 `ROLE` can be served by any node because it is diagnostic. `INFO` describes
 local status. Neither is a KV data read.
@@ -206,7 +220,8 @@ is a documented future operational improvement.
 - StrongKV uses one owned blocking session thread per accepted client
   connection. Reads and writes on a connection are therefore serialized.
 - Session threads enqueue proposals/reads and wait on futures. One proposal
-  worker batches writes and one read worker batches linearizable GETs.
+  worker batches writes; lease GETs complete directly and one read worker
+  batches fallback barriers.
 - `KvStateMachine` protects KV, dedup records, commit index, and snapshot
   metadata with one mutex. Commit order is the NuRaft invocation order.
 - `FileLogStore` protects its in-memory index, pending append batch, and
@@ -331,17 +346,19 @@ node3: client 127.0.0.1:7403, raft 127.0.0.1:7503
 
 This topology genuinely verifies election, quorum replication, leader process
 failure, new election, restart catch-up, full-cluster restart, snapshots,
-compaction, authentication, redirects, and concurrent increments. It does not
-prove behavior under a host/kernel failure and does not create a strict
-network partition unless firewall/network-namespace rules are explicitly
-enabled. Partition behavior follows NuRaft's quorum protocol and the read
-barrier design, but is reported as untested until such a test is actually run.
+compaction, authentication, redirects, and concurrent increments. A paused
+old leader test additionally let the other two voters elect and commit a new
+value; after resuming, a raw non-redirecting GET to the old client port
+returned `NOT_LEADER` instead of its old value. This exercises lease expiry
+across a realistic lost-contact window, but it is not a proof against arbitrary
+kernel faults or unbounded clock-rate error.
 
 ## 13. Known prototype trade-offs
 
 - snapshot compaction still rewrites the remaining WAL instead of rotating
   fixed-size segments;
-- one quorum round trip and log record per concurrent GET batch;
+- lease reads depend on bounded monotonic-clock rate error; the committed
+  barrier remains the conservative fallback;
 - one dedup record retained per client indefinitely;
 - one operating-system thread per connected client;
 - synchronous SDK sockets currently have no per-operation deadline;

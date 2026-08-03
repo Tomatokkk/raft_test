@@ -54,6 +54,7 @@ raft:
   election_timeout_lower_ms: 300
   election_timeout_upper_ms: 600
   client_request_timeout_ms: 5000
+  enable_lease_reads: true
   snapshot_distance: 100
   reserved_log_items: 10
 server:
@@ -76,6 +77,17 @@ SKV_TEST(config_parser_loads_cluster_and_local_node) {
                   std::string("127.0.0.1:7502"));
     SKV_EXPECT_EQ(config.cluster_nodes.size(), std::size_t{3});
     SKV_EXPECT_EQ(config.max_request_size, std::size_t{1048576});
+    SKV_EXPECT_EQ(config.enable_lease_reads, true);
+}
+
+SKV_TEST(config_parser_rejects_invalid_lease_read_boolean) {
+    std::string body(valid_config);
+    const auto position = body.find("enable_lease_reads: true");
+    body.replace(position, std::string("enable_lease_reads: true").size(),
+                 "enable_lease_reads: maybe");
+    const auto path = write_config(body);
+    SKV_EXPECT_THROW(Config::load(path));
+    std::filesystem::remove(path);
 }
 
 SKV_TEST(config_parser_rejects_port_mismatch) {

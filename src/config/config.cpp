@@ -105,6 +105,17 @@ T parse_bounded(const std::string& text, const std::string& field,
     return static_cast<T>(value);
 }
 
+bool parse_boolean(const std::string& text, const std::string& field) {
+    if (text == "true") {
+        return true;
+    }
+    if (text == "false") {
+        return false;
+    }
+    throw std::runtime_error(
+        "invalid boolean value for " + field + ": " + text);
+}
+
 void reject_unknown(const std::string& section, const std::string& key,
                     std::size_t line_number) {
     throw std::runtime_error(
@@ -279,6 +290,9 @@ Config Config::load(const std::filesystem::path& path) {
                 config.client_request_timeout_ms =
                     parse_bounded<std::int32_t>(
                         value, "raft.client_request_timeout_ms", 100, 300000);
+            } else if (key == "enable_lease_reads") {
+                config.enable_lease_reads =
+                    parse_boolean(value, "raft.enable_lease_reads");
             } else if (key == "snapshot_distance") {
                 config.snapshot_distance = parse_bounded<std::int32_t>(
                     value, "raft.snapshot_distance", 1,

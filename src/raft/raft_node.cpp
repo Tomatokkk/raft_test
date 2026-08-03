@@ -5,6 +5,7 @@
 #include "storage/file_log_store.h"
 #include "storage/file_state_manager.h"
 
+#include <algorithm>
 #include <chrono>
 #include <filesystem>
 #include <stdexcept>
@@ -74,6 +75,9 @@ void RaftNode::start() {
     params.max_append_size_ = 256;
     params.use_bg_thread_for_urgent_commit_ = false;
     params.return_method_ = nuraft::raft_params::blocking;
+    // Bound the leader lease by the earliest possible follower election.
+    params.leadership_expiry_ =
+        config_.election_timeout_lower_ms;
     params.auto_forwarding_ = false;
 
     nuraft::raft_server::init_options init_options;
@@ -185,6 +189,22 @@ LinearizableGetResult RaftNode::linearizable_get(
         output.status = RaftRequestStatus::kNotLeader;
         output.detail = "this node is not leader";
         return output;
+    }
+
+    auto state_machine = state_machine_;
+    const std::uint64_t term = server->get_term();
+    if (config_.enable_lease_reads && state_machine &&
+        has_valid_read_lease(server, term)) {
+        auto value = state_machine->get(key);
+        // Close the race with a term change or lease expiry while the state
+        // machine lock was held. If this fails, discard the local value and
+        // fall back to the committed read barrier below.
+        if (has_valid_read_lease(server, term)) {
+            lease_reads_.fetch_add(1, std::memory_order_relaxed);
+            output.status = RaftRequestStatus::kOk;
+            output.value = std::move(value);
+            return output;
+        }
     }
 
     auto pending = std::make_shared<PendingRead>();
@@ -459,6 +479,61 @@ RaftCommandResult RaftNode::unavailable_result(
     return output;
 }
 
+bool RaftNode::has_valid_read_lease(
+        const nuraft::ptr<nuraft::raft_server>& server,
+        std::uint64_t expected_term) const {
+    auto state_machine = state_machine_;
+    if (!server || !state_machine || !server->is_leader() ||
+        server->get_term() != expected_term) {
+        return false;
+    }
+
+    // NuRaft appends a current-term configuration entry upon election. The
+    // public API explicitly exposes its index for strongly consistent reads.
+    const auto leader_start_index =
+        server->get_log_idx_at_becoming_leader();
+    if (leader_start_index == 0 ||
+        server->get_committed_log_idx() < leader_start_index ||
+        state_machine->last_commit_index() < leader_start_index) {
+        return false;
+    }
+
+    std::vector<nuraft::ptr<nuraft::srv_config>> configs;
+    server->get_srv_config_all(configs);
+    std::size_t voters = 0;
+    std::size_t fresh_voters = 0;
+    for (const auto& config : configs) {
+        if (!config || config->is_learner()) {
+            continue;
+        }
+        ++voters;
+        if (config->get_id() == config_.node_id) {
+            ++fresh_voters;
+        }
+    }
+    if (voters == 0) {
+        return false;
+    }
+
+    // Keep one heartbeat interval as a safety margin before the configured
+    // leadership expiry/election lower bound.
+    const auto freshness_ms = std::max<std::int32_t>(
+        1, config_.election_timeout_lower_ms - config_.heartbeat_ms);
+    const auto freshness_us =
+        static_cast<std::uint64_t>(freshness_ms) * 1000;
+    for (const auto& peer : server->get_peer_info_all()) {
+        auto peer_config = server->get_srv_config(peer.id_);
+        if (peer_config && !peer_config->is_learner() &&
+            peer.last_succ_resp_us_ <= freshness_us) {
+            ++fresh_voters;
+        }
+    }
+
+    const std::size_t quorum = voters / 2 + 1;
+    return fresh_voters >= quorum && server->is_leader() &&
+           server->get_term() == expected_term;
+}
+
 bool RaftNode::is_leader() const {
     auto server = server_;
     return running_.load() && server && server->is_leader();
@@ -510,6 +585,8 @@ RaftNodeInfo RaftNode::info() const {
         read_batches_.load(std::memory_order_relaxed);
     output.read_requests =
         read_requests_.load(std::memory_order_relaxed);
+    output.lease_reads =
+        lease_reads_.load(std::memory_order_relaxed);
     return output;
 }
 

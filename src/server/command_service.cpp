@@ -293,6 +293,7 @@ std::string CommandService::info_response() const {
            << "proposal_entries:" << raft.proposal_entries << "\r\n"
            << "read_batches:" << raft.read_batches << "\r\n"
            << "read_requests:" << raft.read_requests << "\r\n"
+           << "lease_reads:" << raft.lease_reads << "\r\n"
            << "client_connections:" << client_connections() << "\r\n"
            << "uptime_seconds:" << uptime << "\r\n";
     return encode_bulk_string(output.str());

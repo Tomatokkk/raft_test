@@ -29,6 +29,7 @@ raft:
   election_timeout_lower_ms: 300
   election_timeout_upper_ms: 600
   client_request_timeout_ms: 5000
+  enable_lease_reads: true
   snapshot_distance: 1000000
   reserved_log_items: 100000
 server:
